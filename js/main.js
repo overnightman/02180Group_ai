@@ -2,7 +2,7 @@
 // No external board library needed!
 
 // ─── CONFIG ──────────────────────────────────────────
-const SIZE       = 19;          // board size (9, 13, or 19)
+const SIZE       = 9;          // board size (9, 13, or 19)
 const CELL       = 34;          // pixels per cell
 const PAD        = 28;          // padding around the grid
 const CANVAS_PX  = CELL * (SIZE - 1) + PAD * 2;
@@ -11,8 +11,9 @@ const EMPTY = 0, BLACK = 1, WHITE = 2;
 
 // ─── STATE ───────────────────────────────────────────
 let board     = Array.from({ length: SIZE }, () => Array(SIZE).fill(EMPTY));
+let previousBoard = null;
 let humanTurn = true;           // human = BLACK, AI = WHITE
-let pyodide, getAIMove;
+let pyodide, getAIMove, playHumanAndAI;
 const statusEl = document.getElementById('status');
 
 // ─── CANVAS SETUP ────────────────────────────────────
@@ -93,52 +94,67 @@ canvas.addEventListener('click', async (e) => {
   const y = Math.round((my - PAD) / CELL);
 
   if (x < 0 || x >= SIZE || y < 0 || y >= SIZE) return;
-  if (board[y][x] !== EMPTY) return;
+  if (!playHumanAndAI) return;
 
-  // Place human stone (BLACK)
-  board[y][x] = BLACK;
-  draw();
   humanTurn = false;
   statusEl.textContent = 'AI is thinking...';
 
   try {
-    // Send board to Python AI
-    const result = getAIMove(board.map(r => Array.from(r)));
+    const result = playHumanAndAI(
+      board.map(r => Array.from(r)),
+      [x, y],
+      previousBoard ? previousBoard.map(r => Array.from(r)) : null
+    );
 
-    let move;
+    let payload;
     if (result && typeof result.toJs === 'function') {
-      move = result.toJs();
+      payload = result.toJs({ dict_converter: Object.fromEntries });
       result.destroy();
     } else {
-      move = result;
+      payload = result;
     }
 
-    if (move && move !== 'pass' && Array.isArray(move)) {
-      board[move[1]][move[0]] = WHITE;
+    if (payload && payload.board) {
+      board = payload.board.map(r => Array.from(r));
+      previousBoard = payload.previous_board ? payload.previous_board.map(r => Array.from(r)) : null;
+      draw();
+      statusEl.textContent = payload.status || 'Your turn (Black)';
+    } else {
+      statusEl.textContent = 'AI returned an invalid response.';
     }
   } catch (err) {
     console.error('AI error:', err);
+    statusEl.textContent = 'AI error: ' + err.message;
   }
 
-  draw();
   humanTurn = true;
-  statusEl.textContent = 'Your turn (Black)';
 });
 
 // ─── INIT PYODIDE ────────────────────────────────────
 async function init() {
-  draw();   // show empty board immediately
+  draw();
 
   try {
     pyodide = await loadPyodide();
     statusEl.textContent = 'Loading AI...';
 
-    // Fetch your Python files
     const engineCode = await fetch('python/ai/engine.py').then(r => r.text());
-    const utilsCode  = await fetch('python/ai/board_utils.py').then(r => r.text()).catch(() => '');
+    const utilsCode = await fetch('python/ai/board_utils.py').then(r => r.text());
 
-    await pyodide.runPythonAsync(utilsCode + '\n' + engineCode);
-    getAIMove = pyodide.globals.get('get_best_move');
+    pyodide.FS.writeFile('board_utils.py', utilsCode);
+    pyodide.FS.writeFile('engine.py', engineCode);
+
+    await pyodide.runPythonAsync(`
+    import importlib
+    import board_utils
+    import engine
+    importlib.reload(board_utils)
+    importlib.reload(engine)
+    `);
+
+    const engineModule = pyodide.pyimport('engine');
+    getAIMove = engineModule.get_best_move;
+    playHumanAndAI = engineModule.play_human_and_ai;
 
     statusEl.textContent = 'Your turn (Black) — click to place a stone!';
   } catch (err) {
